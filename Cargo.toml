@@ -1,0 +1,53 @@
+[package]
+name = "oidc_for_leptos"
+version = "0.1.0"
+edition = "2021"
+description = "OIDC/OAuth2 authentication library for Leptos 0.8.x with cookie-first storage and SSR support"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+leptos = { version = "0.8.2", default-features = false }
+leptos_meta = { version = "0.8.2", default-features = false }
+leptos_router = { version = "0.8.2", default-features = false }
+
+# SSR-only
+leptos_actix = { version = "0.8.2", optional = true }
+actix-web = { version = "4", optional = true }
+
+# WASM-only (hydrate/csr)
+wasm-bindgen = { version = "0.2.101", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "Window", "Location", "Storage", "Document", "HtmlDocument",
+    "Headers", "Request", "RequestInit", "Response",
+    "Navigator", "Performance",
+] }
+
+# Shared
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+base64 = "0.22"
+url = "2.5"
+sha2 = "0.10"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom = "0.2"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+proptest = "1.4"
+
+[features]
+default = []
+ssr = ["leptos/ssr", "leptos_meta/ssr", "leptos_router/ssr", "dep:leptos_actix", "dep:actix-web"]
+hydrate = ["leptos/hydrate", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:serde-wasm-bindgen", "dep:web-sys"]
+csr = ["leptos/csr", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:serde-wasm-bindgen", "dep:web-sys"]
