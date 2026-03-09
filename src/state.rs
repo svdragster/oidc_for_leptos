@@ -128,6 +128,45 @@ impl AuthContext {
         )
     }
 
+    /// Generate a complete login URL with PKCE, state, and nonce.
+    /// Writes PKCE verifier and state to cookies for callback verification.
+    /// Use this for programmatic redirects (as opposed to LoginLink for <a> tags).
+    #[cfg(any(feature = "hydrate", feature = "csr"))]
+    pub fn generate_login_url(&self) -> Result<String, crate::error::OidcError> {
+        use base64::Engine;
+
+        let pkce = crate::pkce::generate()?;
+        crate::cookie::browser::write_pkce_verifier(&self.config, &pkce.verifier);
+
+        // Generate state for CSRF protection
+        let mut state_bytes = [0u8; 16];
+        getrandom::getrandom(&mut state_bytes)
+            .map_err(|e| crate::error::OidcError::Pkce(format!("random generation failed: {}", e)))?;
+        let state = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(state_bytes);
+        crate::cookie::browser::write_oauth_state(&self.config, &state);
+
+        // Generate nonce
+        let mut nonce_bytes = [0u8; 16];
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|e| crate::error::OidcError::Pkce(format!("random generation failed: {}", e)))?;
+        let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce_bytes);
+
+        let auth_endpoint = self.config.authorization_endpoint();
+        leptos::logging::log!("[oidc] authorization_endpoint = {}", auth_endpoint);
+        leptos::logging::log!("[oidc] issuer = {}", self.config.issuer);
+
+        Ok(format!(
+            "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256&nonce={}",
+            auth_endpoint,
+            urlencoding::encode(&self.config.client_id),
+            urlencoding::encode(&self.config.redirect_uri),
+            urlencoding::encode(&self.config.scopes.join(" ")),
+            urlencoding::encode(&state),
+            urlencoding::encode(&pkce.challenge),
+            urlencoding::encode(&nonce),
+        ))
+    }
+
     /// Build the logout URL
     pub fn logout_url(&self) -> String {
         let base = self.config.end_session_endpoint();
