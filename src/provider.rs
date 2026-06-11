@@ -133,6 +133,58 @@ pub fn OidcAuthProvider(
                 state_for_effect.set(AuthState::Unauthenticated);
             }
         });
+
+        // Mobile browsers suspend setTimeout while a tab/PWA is backgrounded, so
+        // the proactive refresh timer may never fire before the user interacts
+        // again. Re-check token freshness whenever the tab becomes visible.
+        {
+            use wasm_bindgen::JsCast;
+
+            let config_for_visibility = config.clone();
+            if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+                let closure = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+                    let visible = web_sys::window()
+                        .and_then(|w| w.document())
+                        .map(|d| d.visibility_state() == web_sys::VisibilityState::Visible)
+                        .unwrap_or(false);
+                    if !visible {
+                        return;
+                    }
+
+                    let config = config_for_visibility.clone();
+                    leptos::task::spawn_local(async move {
+                        let Some(tokens) = crate::cookie::browser::read_tokens(&config) else {
+                            return;
+                        };
+                        let now = (js_sys::Date::new_0().get_time() / 1000.0) as i64;
+                        let threshold = config.refresh_threshold_secs as i64;
+
+                        if tokens.expires_at <= now + threshold {
+                            crate::refresh::try_refresh_or_unauthenticate(
+                                &config,
+                                state_for_effect,
+                                access_token_for_effect,
+                                id_token_for_effect,
+                            )
+                            .await;
+                        } else {
+                            // Another tab may have refreshed while this one slept —
+                            // sync signals from the cookies.
+                            access_token_for_effect.set(Some(tokens.access_token));
+                            if config.store_id_token {
+                                id_token_for_effect.set(tokens.id_token);
+                            }
+                        }
+                    });
+                });
+                let _ = document.add_event_listener_with_callback(
+                    "visibilitychange",
+                    closure.as_ref().unchecked_ref(),
+                );
+                // Provider lives for the app's lifetime — leak the listener.
+                closure.forget();
+            }
+        }
     }
 
     // Build and provide AuthContext

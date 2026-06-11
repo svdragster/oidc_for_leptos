@@ -208,7 +208,31 @@ pub async fn try_refresh_or_unauthenticate(
     access_token_signal: leptos::prelude::RwSignal<Option<String>>,
     id_token_signal: leptos::prelude::RwSignal<Option<String>>,
 ) {
-    match refresh_access_token(config).await {
+    refresh_and_apply(config, state_signal, access_token_signal, id_token_signal, false).await;
+}
+
+/// Refresh tokens and apply the result to signals + cookies.
+///
+/// Returns the access token now in effect: the freshly refreshed one, or the one
+/// another tab already refreshed to. Returns None when the session is dead
+/// (revoked/no refresh token) or the refresh failed.
+///
+/// `force` skips the expires_at freshness check — use it after the server
+/// rejected a token that still looked valid locally (revoked server-side).
+pub async fn refresh_and_apply(
+    config: &OidcConfig,
+    state_signal: leptos::prelude::RwSignal<crate::state::AuthState>,
+    access_token_signal: leptos::prelude::RwSignal<Option<String>>,
+    id_token_signal: leptos::prelude::RwSignal<Option<String>>,
+    force: bool,
+) -> Option<String> {
+    let result = if force {
+        force_refresh_access_token(config).await
+    } else {
+        refresh_access_token(config).await
+    };
+
+    match result {
         Ok(response) => {
             let expires_at = (js_sys::Date::new_0().get_time() / 1000.0) as i64
                 + response.expires_in as i64;
@@ -270,11 +294,13 @@ pub async fn try_refresh_or_unauthenticate(
                 access_token_signal,
                 id_token_signal,
             );
+
+            Some(response.access_token)
         }
         Err(OidcError::AlreadyRefreshed) => {
             // Another tab handled it — re-read cookies to update signals
             if let Some(tokens) = cookie::browser::read_tokens(config) {
-                access_token_signal.set(Some(tokens.access_token));
+                access_token_signal.set(Some(tokens.access_token.clone()));
                 if config.store_id_token {
                     id_token_signal.set(tokens.id_token);
                 }
@@ -286,6 +312,9 @@ pub async fn try_refresh_or_unauthenticate(
                     access_token_signal,
                     id_token_signal,
                 );
+                Some(tokens.access_token)
+            } else {
+                None
             }
         }
         Err(OidcError::TokenRevoked) | Err(OidcError::NoRefreshToken) => {
@@ -294,6 +323,7 @@ pub async fn try_refresh_or_unauthenticate(
             access_token_signal.set(None);
             id_token_signal.set(None);
             state_signal.set(crate::state::AuthState::Unauthenticated);
+            None
         }
         Err(e) => {
             leptos::logging::error!("[oidc] refresh failed: {}", e);
@@ -301,6 +331,7 @@ pub async fn try_refresh_or_unauthenticate(
                 "Token refresh failed: {}",
                 e
             )));
+            None
         }
     }
 }

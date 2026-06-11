@@ -104,6 +104,47 @@ impl AuthContext {
         self.id_token.get_untracked()
     }
 
+    /// Return an access token that is valid right now, refreshing first when the
+    /// cookie expiry says it is stale. Complements the proactive setTimeout
+    /// refresh, which does not fire while a mobile tab/PWA is suspended.
+    /// Returns None when unauthenticated or the refresh fails.
+    #[cfg(any(feature = "hydrate", feature = "csr"))]
+    pub async fn valid_access_token(&self) -> Option<String> {
+        let tokens = crate::cookie::browser::read_tokens(&self.config)?;
+        let now = (js_sys::Date::new_0().get_time() / 1000.0) as i64;
+        let leeway = self.config.clock_skew_leeway_secs as i64;
+
+        if tokens.expires_at > now + leeway {
+            // Cookie token is still fresh — sync the signal (another tab may have
+            // refreshed since this one was suspended) and use it directly.
+            self.access_token.set(Some(tokens.access_token.clone()));
+            return Some(tokens.access_token);
+        }
+
+        crate::refresh::refresh_and_apply(
+            &self.config,
+            self.state,
+            self.access_token,
+            self.id_token,
+            false,
+        )
+        .await
+    }
+
+    /// Force a refresh after the server returned 401 although the local expiry
+    /// still looked valid (token revoked server-side). Returns the new token.
+    #[cfg(any(feature = "hydrate", feature = "csr"))]
+    pub async fn refresh_after_unauthorized(&self) -> Option<String> {
+        crate::refresh::refresh_and_apply(
+            &self.config,
+            self.state,
+            self.access_token,
+            self.id_token,
+            true,
+        )
+        .await
+    }
+
     /// Current user info (if authenticated)
     pub fn user_info(&self) -> Option<UserInfo> {
         match self.state.get_untracked() {
