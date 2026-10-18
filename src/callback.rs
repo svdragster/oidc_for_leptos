@@ -44,6 +44,15 @@ pub fn parse_callback(url_str: &str) -> Result<CallbackParams, OidcError> {
     Ok(CallbackParams { code, state })
 }
 
+/// Does the callback URL opt out of persistent token cookies?
+/// True only for `<param>=0` (e.g. `es_persist=0` when "stay signed in" was
+/// unticked); a missing or other value keeps the persistent default.
+pub fn wants_session_cookies(url_str: &str, param: &str) -> bool {
+    url::Url::parse(url_str)
+        .map(|u| u.query_pairs().any(|(k, v)| k == param && v == "0"))
+        .unwrap_or(false)
+}
+
 // -- Browser-side callback handler (code exchange) --
 #[cfg(any(feature = "hydrate", feature = "csr"))]
 pub(crate) mod browser {
@@ -97,6 +106,14 @@ pub(crate) mod browser {
             .filter(|t| !t.is_empty())
             .ok_or_else(|| OidcError::TokenExchange("token response has no refresh_token".into()))?;
 
+        // "Stay signed in" unticked → this login's token cookies are session
+        // cookies (also after refreshes); otherwise persistent (clears an old marker).
+        let session_only = config
+            .session_cookies_param
+            .as_deref()
+            .is_some_and(|param| wants_session_cookies(&href, param));
+        cookie::browser::set_session_only(config, session_only);
+
         // Calculate expires_at
         let now = js_sys::Date::new_0().get_time() / 1000.0;
         let expires_at = now as i64 + token_response.expires_in as i64;
@@ -130,8 +147,8 @@ pub(crate) mod browser {
         }
         state_signal.set(AuthState::Authenticated(user_info));
 
-        // Clean URL (remove ?code=...&state=...)
-        clean_callback_url(&window);
+        // Clean URL (remove ?code=...&state=... and the persistence flag)
+        clean_callback_url(&window, config.session_cookies_param.as_deref());
 
         Ok(())
     }
@@ -192,7 +209,7 @@ pub(crate) mod browser {
     }
 
     /// Remove code/state query params from URL via history.replaceState
-    fn clean_callback_url(window: &web_sys::Window) {
+    fn clean_callback_url(window: &web_sys::Window, persist_param: Option<&str>) {
         if let Ok(href) = window.location().href() {
             if let Ok(parsed) = url::Url::parse(&href) {
                 let clean: String = {
@@ -200,7 +217,12 @@ pub(crate) mod browser {
                     // Remove OAuth callback params, keep others
                     let remaining: Vec<(String, String)> = clean_url
                         .query_pairs()
-                        .filter(|(k, _)| k != "code" && k != "state" && k != "session_state")
+                        .filter(|(k, _)| {
+                            k != "code"
+                                && k != "state"
+                                && k != "session_state"
+                                && persist_param != Some(&**k)
+                        })
                         .map(|(k, v)| (k.to_string(), v.to_string()))
                         .collect();
                     if remaining.is_empty() {
@@ -279,6 +301,19 @@ mod tests {
         .unwrap();
         assert_eq!(result.code, "abc");
         assert_eq!(result.state, "xyz");
+    }
+
+    #[test]
+    fn persist_flag_selects_session_cookies() {
+        let base = "https://app.example.com/auth/postlogin?code=abc&state=xyz";
+        assert!(wants_session_cookies(&format!("{base}&es_persist=0"), "es_persist"));
+        assert!(!wants_session_cookies(base, "es_persist"));
+        assert!(!wants_session_cookies(&format!("{base}&es_persist=1"), "es_persist"));
+        assert!(!wants_session_cookies(&format!("{base}&other=0"), "es_persist"));
+        assert!(!wants_session_cookies("not a url", "es_persist"));
+        // The extra parameter does not disturb the code/state parsing.
+        let parsed = parse_callback(&format!("{base}&es_persist=0")).unwrap();
+        assert_eq!((parsed.code.as_str(), parsed.state.as_str()), ("abc", "xyz"));
     }
 
     #[test]

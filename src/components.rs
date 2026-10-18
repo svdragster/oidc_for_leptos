@@ -60,10 +60,13 @@ pub fn AuthLoading(children: ChildrenFn) -> impl IntoView {
 /// Login link that generates the authorization URL with PKCE on mount.
 /// SSR: renders a placeholder <a href="#">.
 /// CSR/hydrate: generates auth URL once via Effect, writes PKCE verifier to cookie.
+/// `prompt` (optional) is passed to the authorize request, e.g. `"login"` to
+/// demand an explicit sign-in even when the IdP / login UI could reuse a session.
 #[component]
 pub fn LoginLink(
     children: Children,
     #[prop(optional)] class: Option<String>,
+    #[prop(optional, into)] prompt: Option<String>,
 ) -> impl IntoView {
     #[cfg(any(feature = "hydrate", feature = "csr"))]
     {
@@ -105,7 +108,7 @@ pub fn LoginLink(
             );
 
             let config = auth.config();
-            let url = format!(
+            let mut url = format!(
                 "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256&nonce={}",
                 config.authorization_endpoint(),
                 url_encode(&config.client_id),
@@ -115,6 +118,9 @@ pub fn LoginLink(
                 url_encode(&pkce.challenge),
                 url_encode(&nonce),
             );
+            if let Some(prompt) = prompt.as_deref().filter(|p| !p.is_empty()) {
+                url.push_str(&format!("&prompt={}", url_encode(prompt)));
+            }
 
             login_url.set(Some(url));
         });
@@ -128,6 +134,7 @@ pub fn LoginLink(
 
     #[cfg(not(any(feature = "hydrate", feature = "csr")))]
     {
+        let _ = prompt;
         view! {
             <a href="#" class=class.unwrap_or_default()>
                 {children()}

@@ -31,6 +31,12 @@ pub struct OidcConfig {
     pub authorization_endpoint: Option<String>,
     /// Override end_session endpoint (default: {issuer}/oidc/v1/end_session)
     pub end_session_endpoint: Option<String>,
+    /// Query parameter on the login callback URL that opts out of persistent
+    /// token cookies ("stay signed in" unticked). When set and the callback
+    /// carries `<param>=0`, every token cookie of this login is written WITHOUT
+    /// Max-Age (a session cookie, gone when the browser closes), refreshes
+    /// included. Default None: always persistent.
+    pub session_cookies_param: Option<String>,
 }
 
 impl Default for OidcConfig {
@@ -55,6 +61,7 @@ impl Default for OidcConfig {
             token_endpoint: None,
             authorization_endpoint: None,
             end_session_endpoint: None,
+            session_cookies_param: None,
         }
     }
 }

@@ -6,6 +6,12 @@ pub const EXPIRES_AT: &str = "expires_at";
 pub const PKCE_VERIFIER: &str = "verifier";
 pub const OAUTH_STATE: &str = "state";
 pub const USER_INFO: &str = "user_info";
+/// Marker cookie: `0` = this login keeps its token cookies for the browser
+/// session only ([`crate::config::OidcConfig::session_cookies_param`]).
+pub const PERSIST: &str = "persist";
+
+/// Lifetime of persistent token cookies: 180 days (typical refresh-token cap).
+pub const TOKEN_COOKIE_MAX_AGE_SECS: i64 = 180 * 24 * 60 * 60;
 
 /// Container for reading all token cookies at once
 #[derive(Debug, Clone)]
@@ -27,6 +33,29 @@ pub fn parse_cookie_value(cookie_string: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Cookie attribute string. `max_age_secs: None` = session cookie (no
+/// Max-Age/Expires: the browser drops it when it closes).
+pub fn cookie_attributes(max_age_secs: Option<i64>, domain: Option<&str>, secure: bool) -> String {
+    let mut attrs = String::from("Path=/");
+    if let Some(max_age) = max_age_secs {
+        attrs.push_str(&format!("; Max-Age={}", max_age));
+    }
+    attrs.push_str("; SameSite=Lax");
+    if let Some(domain) = domain {
+        attrs.push_str(&format!("; Domain={}", domain));
+    }
+    if secure {
+        attrs.push_str("; Secure");
+    }
+    attrs
+}
+
+/// Max-Age for token cookies: None (session cookie) when the login opted out
+/// of persistence, else [`TOKEN_COOKIE_MAX_AGE_SECS`].
+pub fn token_cookie_max_age(session_only: bool) -> Option<i64> {
+    (!session_only).then_some(TOKEN_COOKIE_MAX_AGE_SECS)
 }
 
 // -- Browser cookie operations --
@@ -56,16 +85,9 @@ pub mod browser {
         true
     }
 
-    /// Build cookie attribute string
-    fn cookie_attrs(config: &OidcConfig, max_age_secs: i64) -> String {
-        let mut attrs = format!("Path=/; Max-Age={}; SameSite=Lax", max_age_secs);
-        if let Some(ref domain) = config.cookie_domain {
-            attrs.push_str(&format!("; Domain={}", domain));
-        }
-        if should_use_secure(config) {
-            attrs.push_str("; Secure");
-        }
-        attrs
+    /// Build cookie attribute string (None = session cookie)
+    fn cookie_attrs(config: &OidcConfig, max_age_secs: Option<i64>) -> String {
+        cookie_attributes(max_age_secs, config.cookie_domain.as_deref(), should_use_secure(config))
     }
 
     /// Read a single cookie by name
@@ -77,12 +99,34 @@ pub mod browser {
 
     /// Write a single cookie
     pub fn write_cookie(name: &str, value: &str, config: &OidcConfig, max_age_secs: i64) {
+        write_cookie_with(name, value, config, Some(max_age_secs));
+    }
+
+    /// Write a single cookie; `max_age_secs: None` = session cookie.
+    pub fn write_cookie_with(name: &str, value: &str, config: &OidcConfig, max_age_secs: Option<i64>) {
         let Some(document) = get_document() else {
             return;
         };
         let attrs = cookie_attrs(config, max_age_secs);
         let cookie = format!("{}={}; {}", name, value, attrs);
         let _ = document.set_cookie(&cookie);
+    }
+
+    /// Remember whether this login keeps its token cookies for the browser
+    /// session only (`true`) or persistently (`false`, the default). The
+    /// marker itself is a session cookie, so it can never outlive the tokens.
+    pub fn set_session_only(config: &OidcConfig, session_only: bool) {
+        let name = config.cookie_name(PERSIST);
+        if session_only {
+            write_cookie_with(&name, "0", config, None);
+        } else {
+            clear_cookie(&name, config);
+        }
+    }
+
+    /// Whether the current login keeps its token cookies for the session only.
+    pub fn is_session_only(config: &OidcConfig) -> bool {
+        read_cookie(&config.cookie_name(PERSIST)).as_deref() == Some("0")
     }
 
     /// Clear a single cookie by setting it to expire
@@ -131,16 +175,17 @@ pub mod browser {
         id_token: Option<&str>,
         expires_at: i64,
     ) {
-        // Cookie max-age: 180 days (matches typical refresh token lifetime)
-        let max_age = 180 * 24 * 60 * 60;
+        // 180 days, or a session cookie when this login opted out of
+        // persistence (refreshes keep that choice via the PERSIST marker).
+        let max_age = token_cookie_max_age(is_session_only(config));
 
-        write_cookie(
+        write_cookie_with(
             &config.cookie_name(ACCESS_TOKEN),
             access_token,
             config,
             max_age,
         );
-        write_cookie(
+        write_cookie_with(
             &config.cookie_name(REFRESH_TOKEN),
             refresh_token,
             config,
@@ -148,7 +193,7 @@ pub mod browser {
         );
         if config.store_id_token {
             if let Some(id_token) = id_token {
-                write_cookie(
+                write_cookie_with(
                     &config.cookie_name(ID_TOKEN),
                     id_token,
                     config,
@@ -156,7 +201,7 @@ pub mod browser {
                 );
             }
         }
-        write_cookie(
+        write_cookie_with(
             &config.cookie_name(EXPIRES_AT),
             &expires_at.to_string(),
             config,
@@ -171,6 +216,7 @@ pub mod browser {
         clear_cookie(&config.cookie_name(ID_TOKEN), config);
         clear_cookie(&config.cookie_name(EXPIRES_AT), config);
         clear_cookie(&config.cookie_name(USER_INFO), config);
+        clear_cookie(&config.cookie_name(PERSIST), config);
     }
 
     /// Write PKCE verifier to a short-lived cookie (5 min)
@@ -220,12 +266,11 @@ pub mod browser {
             let encoded = js_sys::encode_uri_component(&json)
                 .as_string()
                 .unwrap_or_default();
-            let max_age = 180 * 24 * 60 * 60;
-            write_cookie(
+            write_cookie_with(
                 &config.cookie_name(USER_INFO),
                 &encoded,
                 config,
-                max_age,
+                token_cookie_max_age(is_session_only(config)),
             );
         }
     }
@@ -344,6 +389,32 @@ mod tests {
     #[test]
     fn parse_cookie_value_no_equals() {
         assert_eq!(parse_cookie_value("nopair", "nopair"), None);
+    }
+
+    #[test]
+    fn persistent_cookie_attributes() {
+        assert_eq!(
+            cookie_attributes(Some(300), None, true),
+            "Path=/; Max-Age=300; SameSite=Lax; Secure"
+        );
+        assert_eq!(
+            cookie_attributes(Some(0), Some(".example.com"), false),
+            "Path=/; Max-Age=0; SameSite=Lax; Domain=.example.com"
+        );
+    }
+
+    #[test]
+    fn session_cookie_attributes_have_no_lifetime() {
+        let attrs = cookie_attributes(None, None, true);
+        assert_eq!(attrs, "Path=/; SameSite=Lax; Secure");
+        assert!(!attrs.contains("Max-Age"));
+        assert!(!attrs.contains("Expires"));
+    }
+
+    #[test]
+    fn token_cookie_lifetime_follows_the_persist_choice() {
+        assert_eq!(token_cookie_max_age(false), Some(180 * 24 * 60 * 60));
+        assert_eq!(token_cookie_max_age(true), None);
     }
 
     #[test]
