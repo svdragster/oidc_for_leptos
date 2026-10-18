@@ -1,7 +1,10 @@
-/// Web Locks API wrapper for preventing token refresh race conditions across tabs.
-///
-/// Primary: Web Locks API (navigator.locks.request) for true cross-tab mutex.
-/// Fallback: proceed optimistically — cookie-check in refresh logic handles double-refresh.
+//! Web Locks API wrapper for preventing token refresh race conditions across tabs.
+//!
+//! Primary: Web Locks API (navigator.locks.request) for a true cross-tab mutex.
+//! Fallback (no Web Locks, lock request rejected, or waited longer than
+//! `refresh_policy::LOCK_TIMEOUT_MS` — e.g. a frozen tab holds it): proceed
+//! without the lock. The refresh logic then relies on rotation hygiene
+//! (freshness re-check, cookie re-read before clearing, confirmation re-send).
 
 use wasm_bindgen::prelude::*;
 
@@ -10,12 +13,13 @@ use wasm_bindgen::prelude::*;
 export function is_web_locks_available() {
     return typeof navigator !== 'undefined' &&
            typeof navigator.locks !== 'undefined' &&
+           navigator.locks !== null &&
            typeof navigator.locks.request === 'function';
 }
 
-export function acquire_web_lock(name) {
+export function acquire_web_lock(name, timeoutMs) {
     return new Promise((resolveOuter) => {
-        if (!navigator.locks) {
+        if (!is_web_locks_available()) {
             resolveOuter({ acquired: false });
             return;
         }
@@ -25,13 +29,26 @@ export function acquire_web_lock(name) {
             releaseCallback = resolve;
         });
 
-        navigator.locks.request(name, { mode: 'exclusive' }, async (lock) => {
-            resolveOuter({
-                acquired: true,
-                release: releaseCallback
+        // Bounded wait: abort the queued request after timeoutMs.
+        const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+        const opts = { mode: 'exclusive' };
+        if (ctrl) { opts.signal = ctrl.signal; }
+
+        try {
+            navigator.locks.request(name, opts, async (lock) => {
+                if (timer) { clearTimeout(timer); }
+                resolveOuter({ acquired: true, release: releaseCallback });
+                await releasePromise;
+            }).catch(() => {
+                // Aborted (timeout) or rejected (e.g. SecurityError): run unlocked.
+                if (timer) { clearTimeout(timer); }
+                resolveOuter({ acquired: false });
             });
-            await releasePromise;
-        });
+        } catch (e) {
+            if (timer) { clearTimeout(timer); }
+            resolveOuter({ acquired: false });
+        }
     });
 }
 
@@ -43,45 +60,38 @@ export function release_web_lock(lockHandle) {
 "#)]
 extern "C" {
     fn is_web_locks_available() -> bool;
-    fn acquire_web_lock(name: &str) -> js_sys::Promise;
+    fn acquire_web_lock(name: &str, timeout_ms: u32) -> js_sys::Promise;
     fn release_web_lock(lock_handle: &JsValue);
 }
 
-/// Execute a function while holding the refresh lock.
-/// Prevents multiple tabs from refreshing simultaneously.
-pub async fn with_refresh_lock<F, Fut, T, E>(lock_name: &str, f: F) -> Result<T, E>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
-{
-    if is_web_locks_available() {
-        with_web_lock(lock_name, f).await
-    } else {
-        // Simplified fallback: just proceed optimistically.
-        // Cookie-check in refresh logic prevents actual double-refresh.
-        f().await
-    }
+/// Whether the browser offers Web Locks (missing on iOS < 15.4). Telemetry fact.
+pub fn web_locks_available() -> bool {
+    is_web_locks_available()
 }
 
-/// Execute function with Web Locks API
-async fn with_web_lock<F, Fut, T, E>(lock_name: &str, f: F) -> Result<T, E>
+/// Execute a future while holding the cross-tab refresh lock (best effort,
+/// see module docs). Prevents multiple tabs from refreshing simultaneously.
+pub async fn with_refresh_lock<F, Fut, T>(lock_name: &str, f: F) -> T
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
+    Fut: std::future::Future<Output = T>,
 {
-    let lock_result = wasm_bindgen_futures::JsFuture::from(acquire_web_lock(lock_name)).await;
+    if !is_web_locks_available() {
+        return f().await;
+    }
 
-    let lock_handle = match lock_result {
-        Ok(handle) => handle,
-        Err(_) => {
-            // Lock acquisition failed, proceed without lock
-            return f().await;
-        }
-    };
+    let lock_handle = wasm_bindgen_futures::JsFuture::from(acquire_web_lock(
+        lock_name,
+        crate::refresh_policy::LOCK_TIMEOUT_MS,
+    ))
+    .await
+    .ok();
 
     let result = f().await;
 
-    release_web_lock(&lock_handle);
+    if let Some(handle) = lock_handle {
+        release_web_lock(&handle);
+    }
 
     result
 }

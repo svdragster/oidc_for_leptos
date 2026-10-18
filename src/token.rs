@@ -66,6 +66,20 @@ pub fn extract_user_info(claims: &JwtClaims) -> UserInfo {
     }
 }
 
+/// User info from an access token (JWT with `sub`) or, failing that, the ID
+/// token. None when neither decodes (opaque access token, no ID token) — the
+/// caller then falls back to the stored user_info cookie.
+pub fn user_info_from_tokens(access_token: &str, id_token: Option<&str>) -> Option<UserInfo> {
+    if let Ok(claims) = decode_claims(access_token) {
+        if claims.sub.is_some() {
+            return Some(extract_user_info(&claims));
+        }
+    }
+    id_token
+        .and_then(|t| decode_claims(t).ok())
+        .map(|c| extract_user_info(&c))
+}
+
 /// Check if token is expired. Missing exp = treated as expired.
 pub fn is_expired(claims: &JwtClaims, now_secs: i64, leeway_secs: i64) -> bool {
     match claims.exp {

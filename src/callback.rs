@@ -90,6 +90,12 @@ pub(crate) mod browser {
 
         // Exchange code at token endpoint
         let token_response = exchange_code(config, &params.code, &verifier).await?;
+        // The session needs a refresh token (scope offline_access).
+        let refresh_token = token_response
+            .refresh_token
+            .clone()
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| OidcError::TokenExchange("token response has no refresh_token".into()))?;
 
         // Calculate expires_at
         let now = js_sys::Date::new_0().get_time() / 1000.0;
@@ -99,7 +105,7 @@ pub(crate) mod browser {
         cookie::browser::write_tokens(
             config,
             &token_response.access_token,
-            &token_response.refresh_token,
+            &refresh_token,
             token_response.id_token.as_deref(),
             expires_at,
         );
@@ -152,7 +158,9 @@ pub(crate) mod browser {
                 .unwrap_or_default(),
         );
 
-        crate::refresh::fetch_token_endpoint(&config.token_endpoint(), &body).await
+        crate::refresh::fetch_token_endpoint(&config.token_endpoint(), &body)
+            .await
+            .map_err(|f| OidcError::TokenExchange(f.summary()))
     }
 
     /// Extract user info from access_token (try JWT decode) or id_token as fallback

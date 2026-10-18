@@ -22,6 +22,41 @@ pub enum AuthState {
     Error(String),
 }
 
+/// Why no access token could be produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenUnavailable {
+    /// The session is over (no tokens, or the IdP rejected the refresh token):
+    /// send the user to login.
+    Terminal,
+    /// The IdP could not be reached or answered with a temporary error. Tokens
+    /// and state are kept and the refresh is retried — never log out for this.
+    Transient,
+}
+
+/// Health of the silent refresh, separate from [`AuthState`]: a transient
+/// failure keeps the `AuthState` as it is and only shows up here (drives the
+/// host app's reconnect notice).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RefreshStatus {
+    /// A token request is running in this tab.
+    pub in_flight: bool,
+    /// Consecutive failed attempts of the current run (0 = healthy).
+    pub failed_attempts: u32,
+    /// Unix seconds of the first failure of the current run.
+    pub failing_since: Option<i64>,
+    /// The run has been failing for ~30 s: offer a manual retry.
+    pub stalled: bool,
+    /// Why the session ended — set together with `AuthState::Unauthenticated`.
+    pub end_reason: Option<crate::refresh_policy::SessionEndReason>,
+}
+
+impl RefreshStatus {
+    /// Automatic retries are running after a transient failure.
+    pub fn is_reconnecting(&self) -> bool {
+        self.failed_attempts > 0
+    }
+}
+
 /// Clock abstraction for deterministic testing
 pub trait Clock: Send + Sync + 'static {
     fn now_unix_secs(&self) -> i64;
@@ -76,6 +111,7 @@ pub struct AuthContext {
     pub(crate) config: OidcConfig,
     pub(crate) access_token: RwSignal<Option<String>>,
     pub(crate) id_token: RwSignal<Option<String>>,
+    pub(crate) refresh_status: RwSignal<RefreshStatus>,
 }
 
 impl AuthContext {
@@ -104,45 +140,60 @@ impl AuthContext {
         self.id_token.get_untracked()
     }
 
+    /// Refresh health (in flight, failing, stalled, end reason).
+    pub fn refresh_status(&self) -> RwSignal<RefreshStatus> {
+        self.refresh_status
+    }
+
+    /// Retry a failing refresh right now (manual "retry" button). Resets the
+    /// backoff wait; no-op on the server or when nothing is failing.
+    pub fn retry_refresh_now(&self) {
+        #[cfg(any(feature = "hydrate", feature = "csr"))]
+        crate::session::retry_now();
+    }
+
     /// Return an access token that is valid right now, refreshing first when the
     /// cookie expiry says it is stale. Complements the proactive setTimeout
     /// refresh, which does not fire while a mobile tab/PWA is suspended.
-    /// Returns None when unauthenticated or the refresh fails.
+    /// Returns None when unauthenticated or the refresh fails (either way —
+    /// use [`Self::valid_access_token_checked`] to tell them apart).
     #[cfg(any(feature = "hydrate", feature = "csr"))]
     pub async fn valid_access_token(&self) -> Option<String> {
-        let tokens = crate::cookie::browser::read_tokens(&self.config)?;
-        let now = (js_sys::Date::new_0().get_time() / 1000.0) as i64;
+        self.valid_access_token_checked().await.ok()
+    }
+
+    /// Like [`Self::valid_access_token`], but says whether a missing token is
+    /// terminal (session over) or transient (IdP unreachable, retrying).
+    #[cfg(any(feature = "hydrate", feature = "csr"))]
+    pub async fn valid_access_token_checked(&self) -> Result<String, TokenUnavailable> {
+        let Some(tokens) = crate::cookie::browser::read_tokens(&self.config) else {
+            // No session cookies at all (logged out, possibly in another tab).
+            crate::session::end_session_without_tokens();
+            return Err(TokenUnavailable::Terminal);
+        };
+        let now = crate::session::now_secs();
         let leeway = self.config.clock_skew_leeway_secs as i64;
 
         if tokens.expires_at > now + leeway {
-            // Cookie token is still fresh — sync the signal (another tab may have
+            // Cookie token is still fresh — sync the signals (another tab may have
             // refreshed since this one was suspended) and use it directly.
-            self.access_token.set(Some(tokens.access_token.clone()));
-            return Some(tokens.access_token);
+            return Ok(crate::session::sync_from_cookie(tokens));
         }
 
-        crate::refresh::refresh_and_apply(
-            &self.config,
-            self.state,
-            self.access_token,
-            self.id_token,
-            false,
-        )
-        .await
+        crate::session::refresh(crate::events::RefreshTrigger::Api, false).await
     }
 
     /// Force a refresh after the server returned 401 although the local expiry
     /// still looked valid (token revoked server-side). Returns the new token.
     #[cfg(any(feature = "hydrate", feature = "csr"))]
     pub async fn refresh_after_unauthorized(&self) -> Option<String> {
-        crate::refresh::refresh_and_apply(
-            &self.config,
-            self.state,
-            self.access_token,
-            self.id_token,
-            true,
-        )
-        .await
+        self.refresh_after_unauthorized_checked().await.ok()
+    }
+
+    /// Like [`Self::refresh_after_unauthorized`], terminal vs. transient.
+    #[cfg(any(feature = "hydrate", feature = "csr"))]
+    pub async fn refresh_after_unauthorized_checked(&self) -> Result<String, TokenUnavailable> {
+        crate::session::refresh(crate::events::RefreshTrigger::Unauthorized, true).await
     }
 
     /// Current user info (if authenticated)

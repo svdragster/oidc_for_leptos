@@ -27,7 +27,11 @@ web-sys = { version = "0.3", optional = true, features = [
     "Headers", "Request", "RequestInit", "Response",
     "Navigator", "Performance",
     "EventTarget", "VisibilityState",
+    # Refresh robustness (ES-One doc 27): request timeout, bfcache restore
+    "AbortController", "AbortSignal", "Event", "PageTransitionEvent",
 ] }
+# Single-flight refresh (shared future + oneshot) in the browser session engine
+futures = { version = "0.3", optional = true }
 
 # Shared
 serde = { version = "1.0", features = ["derive"] }
@@ -50,5 +54,5 @@ proptest = "1.4"
 [features]
 default = []
 ssr = ["leptos/ssr", "leptos_meta/ssr", "leptos_router/ssr", "dep:leptos_actix", "dep:actix-web"]
-hydrate = ["leptos/hydrate", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:serde-wasm-bindgen", "dep:web-sys"]
-csr = ["leptos/csr", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:serde-wasm-bindgen", "dep:web-sys"]
+hydrate = ["leptos/hydrate", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:serde-wasm-bindgen", "dep:web-sys", "dep:futures"]
+csr = ["leptos/csr", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:serde-wasm-bindgen", "dep:web-sys", "dep:futures"]

@@ -13,6 +13,7 @@ pub enum OidcError {
     #[error("Token refresh failed: {0}")]
     TokenRefresh(String),
 
+    /// Legacy variant: refresh failures are classified by `refresh_policy` now.
     #[error("Token was revoked by the auth server")]
     TokenRevoked,
 

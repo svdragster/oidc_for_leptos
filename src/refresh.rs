@@ -1,15 +1,19 @@
-/// Token refresh logic with cross-tab coordination via Web Locks.
-///
-/// Flow: acquire lock → re-check if still needed → call IdP → update cookies → release lock.
+//! Token endpoint I/O (browser only).
+//!
+//! One refresh attempt = read cookies → re-check freshness → POST the
+//! refresh_token grant (with a timeout) → write cookies. It runs while the
+//! cross-tab lock is held. What a failure *means* is decided by
+//! `refresh_policy` (pure); retries, state and events live in `session`.
 
-use leptos::prelude::*;
 use serde::Deserialize;
 use wasm_bindgen::JsCast;
 
 use crate::config::OidcConfig;
-use crate::cookie;
-use crate::error::OidcError;
-use crate::locks;
+use crate::cookie::{self, TokenCookies};
+use crate::refresh_policy::{
+    self, classify_http_failure, FailureClass, InflightMarker, TokenEndpointFailure,
+    REQUEST_TIMEOUT_MS,
+};
 
 /// Token response from the IdP's token endpoint
 #[derive(Debug, Clone, Deserialize)]
@@ -17,321 +21,250 @@ pub struct TokenResponse {
     pub access_token: String,
     #[serde(default)]
     pub id_token: Option<String>,
-    pub refresh_token: String,
+    /// Optional on refresh (RFC 6749 §6: keep the old one when none is issued);
+    /// the code exchange requires it and checks for it.
+    #[serde(default)]
+    pub refresh_token: Option<String>,
     pub expires_in: u64,
     #[serde(default)]
     pub token_type: String,
 }
 
-/// Refresh the access token using the refresh_token from cookies.
-/// Uses Web Locks to prevent thundering herd across tabs.
-pub async fn refresh_access_token(config: &OidcConfig) -> Result<TokenResponse, OidcError> {
-    let lock_name = format!("{}_refresh_lock", config.cookie_name_prefix);
-    let config = config.clone();
-
-    locks::with_refresh_lock(&lock_name, || async {
-        refresh_inner(&config, false).await
-    })
-    .await
+/// Result of one refresh attempt.
+pub(crate) enum Attempt {
+    /// New tokens were issued and written to the cookies.
+    Refreshed {
+        access_token: String,
+        id_token: Option<String>,
+        expires_at: i64,
+    },
+    /// The cookie token is already fresh (another tab refreshed): nothing sent.
+    AlreadyFresh(TokenCookies),
+    /// No refresh token stored: there is no session to refresh.
+    NoTokens,
+    /// The request failed; `failure` says how.
+    Failed {
+        failure: TokenEndpointFailure,
+        /// The refresh token that was sent (compared with the cookie afterwards).
+        sent_refresh_token: String,
+        /// A leftover in-flight marker matched the sent token.
+        rotation_lost: bool,
+    },
 }
 
-/// Force-refresh: skip the expires_at freshness check.
-/// Used when token was revoked server-side but local expiry looks valid.
-pub async fn force_refresh_access_token(config: &OidcConfig) -> Result<TokenResponse, OidcError> {
-    let lock_name = format!("{}_refresh_lock", config.cookie_name_prefix);
-    let config = config.clone();
-
-    locks::with_refresh_lock(&lock_name, || async {
-        refresh_inner(&config, true).await
-    })
-    .await
-}
-
-/// Inner refresh logic that runs while holding the lock
-async fn refresh_inner(config: &OidcConfig, force: bool) -> Result<TokenResponse, OidcError> {
-    let tokens = cookie::browser::read_tokens(config)
-        .ok_or(OidcError::NoRefreshToken)?;
-
-    // Re-check if refresh is still needed (another tab may have done it)
-    if !force {
-        let now = (js_sys::Date::new_0().get_time() / 1000.0) as i64;
-        let threshold = config.refresh_threshold_secs as i64;
-        if tokens.expires_at > now + threshold {
-            return Err(OidcError::AlreadyRefreshed);
-        }
-    }
-
+/// One refresh attempt; call it while holding the cross-tab lock.
+///
+/// `force` skips the freshness check (the API rejected a locally valid token).
+/// `check_marker` evaluates a leftover in-flight marker — only on the first
+/// attempt of a run, so a confirmation re-send doesn't label itself.
+pub(crate) async fn attempt_refresh(config: &OidcConfig, force: bool, check_marker: bool) -> Attempt {
+    let Some(tokens) = cookie::browser::read_tokens(config) else {
+        return Attempt::NoTokens;
+    };
     if tokens.refresh_token.is_empty() {
-        return Err(OidcError::NoRefreshToken);
+        return Attempt::NoTokens;
     }
 
-    // Build form body for refresh_token grant
+    // Re-check inside the lock: another tab may have refreshed meanwhile.
+    let now = crate::session::now_secs();
+    if !force && tokens.expires_at > now + config.refresh_threshold_secs as i64 {
+        return Attempt::AlreadyFresh(tokens);
+    }
+
+    // Rotation hygiene: remember that a request with this token is on its way.
+    let fingerprint = refresh_policy::token_fingerprint(&tokens.refresh_token);
+    let prior = if check_marker { read_marker(config) } else { None };
+    let rotation_lost = refresh_policy::is_rotation_lost(prior.as_ref(), &fingerprint);
+    write_marker(config, &InflightMarker { fingerprint, started_at: now });
+
     let body = format!(
         "grant_type=refresh_token&client_id={}&refresh_token={}",
-        js_sys::encode_uri_component(&config.client_id)
-            .as_string()
-            .unwrap_or_default(),
-        js_sys::encode_uri_component(&tokens.refresh_token)
-            .as_string()
-            .unwrap_or_default(),
+        encode(&config.client_id),
+        encode(&tokens.refresh_token),
     );
 
-    let response = fetch_token_endpoint(&config.token_endpoint(), &body).await?;
+    match fetch_token_endpoint(&config.token_endpoint(), &body).await {
+        Ok(response) => {
+            let expires_at = crate::session::now_secs() + response.expires_in as i64;
+            let refresh_token = response
+                .refresh_token
+                .clone()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| tokens.refresh_token.clone());
+            // Preserve the existing id_token if the refresh response has none.
+            let id_token = response.id_token.clone().or_else(|| tokens.id_token.clone());
 
-    // Calculate new expires_at
-    let now = (js_sys::Date::new_0().get_time() / 1000.0) as i64;
-    let expires_at = now + response.expires_in as i64;
+            cookie::browser::write_tokens(
+                config,
+                &response.access_token,
+                &refresh_token,
+                id_token.as_deref(),
+                expires_at,
+            );
+            clear_marker(config);
 
-    // Preserve existing id_token if refresh response doesn't include one
-    let id_token = response.id_token.as_deref().or_else(|| {
-        tokens.id_token.as_deref()
-    });
-
-    // Write updated tokens to cookies
-    cookie::browser::write_tokens(
-        config,
-        &response.access_token,
-        &response.refresh_token,
-        id_token,
-        expires_at,
-    );
-
-    Ok(response)
+            Attempt::Refreshed {
+                access_token: response.access_token,
+                id_token,
+                expires_at,
+            }
+        }
+        Err(failure) => {
+            // A definitive rejection did not rotate anything. Transient outcomes
+            // (lost reply, timeout, gateway error, unusable 2xx body) keep the
+            // marker: the IdP may have rotated the token already.
+            if failure.class != FailureClass::Transient {
+                clear_marker(config);
+            }
+            Attempt::Failed {
+                failure,
+                sent_refresh_token: tokens.refresh_token,
+                rotation_lost,
+            }
+        }
+    }
 }
 
-/// Make HTTP request to token endpoint using web-sys fetch API
+/// POST a form body to the token endpoint, aborting after
+/// [`REQUEST_TIMEOUT_MS`]. Failures come back classified.
 pub(crate) async fn fetch_token_endpoint(
     url: &str,
     body: &str,
-) -> Result<TokenResponse, OidcError> {
-    let window = web_sys::window()
-        .ok_or_else(|| OidcError::Network("no window object".into()))?;
+) -> Result<TokenResponse, TokenEndpointFailure> {
+    let window = web_sys::window().ok_or_else(|| TokenEndpointFailure::transient("no window object"))?;
 
     let opts = web_sys::RequestInit::new();
     opts.set_method("POST");
     opts.set_body(&wasm_bindgen::JsValue::from_str(body));
 
     let headers = web_sys::Headers::new()
-        .map_err(|e| OidcError::Network(format!("failed to create headers: {:?}", e)))?;
+        .map_err(|e| TokenEndpointFailure::transient(format!("headers: {}", js_message(&e))))?;
     headers
         .set("Content-Type", "application/x-www-form-urlencoded")
-        .map_err(|e| OidcError::Network(format!("failed to set header: {:?}", e)))?;
+        .map_err(|e| TokenEndpointFailure::transient(format!("headers: {}", js_message(&e))))?;
     opts.set_headers(&headers);
 
+    // Bounded request: a hung connection must not block the refresh forever.
+    let abort = web_sys::AbortController::new().ok();
+    if let Some(ref ctrl) = abort {
+        opts.set_signal(Some(&ctrl.signal()));
+    }
+    let timeout = abort.as_ref().and_then(|ctrl| {
+        let ctrl = ctrl.clone();
+        let cb = wasm_bindgen::closure::Closure::once(move || ctrl.abort());
+        let id = window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                REQUEST_TIMEOUT_MS as i32,
+            )
+            .ok()?;
+        Some((id, cb))
+    });
+
     let request = web_sys::Request::new_with_str_and_init(url, &opts)
-        .map_err(|e| OidcError::Network(format!("failed to create request: {:?}", e)))?;
+        .map_err(|e| TokenEndpointFailure::transient(format!("request: {}", js_message(&e))))?;
 
-    let promise = window.fetch_with_request(&request);
-    let response_value = wasm_bindgen_futures::JsFuture::from(promise)
-        .await
-        .map_err(|e| OidcError::Network(format!("fetch failed: {:?}", e)))?;
+    let result = wasm_bindgen_futures::JsFuture::from(window.fetch_with_request(&request)).await;
+    let timed_out = abort.as_ref().map(|c| c.signal().aborted()).unwrap_or(false);
+    if let Some((id, _cb)) = timeout {
+        window.clear_timeout_with_handle(id);
+    }
 
-    let response: web_sys::Response = response_value
-        .dyn_into()
-        .map_err(|_| OidcError::Network("response is not a Response object".into()))?;
+    let response: web_sys::Response = match result {
+        Ok(v) => v
+            .dyn_into()
+            .map_err(|_| TokenEndpointFailure::transient("response is not a Response object"))?,
+        Err(e) if timed_out => {
+            return Err(TokenEndpointFailure::transient(format!(
+                "timeout after {} ms ({})",
+                REQUEST_TIMEOUT_MS,
+                js_message(&e)
+            )))
+        }
+        Err(e) => {
+            return Err(TokenEndpointFailure::transient(format!("fetch failed: {}", js_message(&e))))
+        }
+    };
 
     let status = response.status();
 
-    if status == 400 || status == 401 {
-        // Log error body for diagnostics
-        if let Ok(text_promise) = response.text() {
-            if let Ok(text_value) = wasm_bindgen_futures::JsFuture::from(text_promise).await {
-                let body_text = text_value.as_string().unwrap_or_default();
-                leptos::logging::error!(
-                    "[oidc] token endpoint returned {}: {}",
-                    status,
-                    body_text
-                );
-            }
-        }
-        return Err(OidcError::TokenRevoked);
-    }
-
     if !response.ok() {
-        return Err(OidcError::Network(format!(
-            "token endpoint returned status {}",
-            status
-        )));
+        let body_text = match response.text() {
+            Ok(p) => wasm_bindgen_futures::JsFuture::from(p)
+                .await
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        let failure = classify_http_failure(status, &body_text);
+        leptos::logging::error!("[oidc] token endpoint returned {}: {}", status, failure.summary());
+        return Err(failure);
     }
 
     let json_promise = response
         .json()
-        .map_err(|e| OidcError::TokenExchange(format!("failed to get JSON: {:?}", e)))?;
+        .map_err(|e| TokenEndpointFailure::transient(format!("unreadable body: {}", js_message(&e))))?;
     let json_value = wasm_bindgen_futures::JsFuture::from(json_promise)
         .await
-        .map_err(|e| OidcError::TokenExchange(format!("failed to parse JSON: {:?}", e)))?;
+        .map_err(|e| TokenEndpointFailure::transient(format!("invalid JSON: {}", js_message(&e))))?;
 
     serde_wasm_bindgen::from_value(json_value)
-        .map_err(|e| OidcError::TokenExchange(format!("failed to deserialize: {:?}", e)))
+        .map_err(|e| TokenEndpointFailure::transient(format!("unexpected token response: {}", e)))
 }
 
-/// Schedule a token refresh timer (setTimeout) for `threshold` seconds before expiry
-pub fn schedule_refresh(
-    config: OidcConfig,
-    expires_at: i64,
-    state_signal: leptos::prelude::RwSignal<crate::state::AuthState>,
-    access_token_signal: leptos::prelude::RwSignal<Option<String>>,
-    id_token_signal: leptos::prelude::RwSignal<Option<String>>,
-) {
-    let now = (js_sys::Date::new_0().get_time() / 1000.0) as i64;
-    let threshold = config.refresh_threshold_secs as i64;
-    let delay_secs = (expires_at - threshold) - now;
-
-    if delay_secs <= 0 {
-        // Already needs refresh, do it now
-        leptos::task::spawn_local(async move {
-            try_refresh_or_unauthenticate(&config, state_signal, access_token_signal, id_token_signal).await;
-        });
-        return;
+/// Best-effort message of a JS error value (never contains request bodies).
+fn js_message(value: &wasm_bindgen::JsValue) -> String {
+    if let Some(s) = value.as_string() {
+        return s;
     }
+    js_sys::Reflect::get(value, &wasm_bindgen::JsValue::from_str("message"))
+        .ok()
+        .and_then(|m| m.as_string())
+        .unwrap_or_else(|| "unknown error".to_string())
+}
 
-    let delay_ms = (delay_secs * 1000) as i32;
+fn encode(s: &str) -> String {
+    js_sys::encode_uri_component(s).as_string().unwrap_or_default()
+}
 
-    if let Some(window) = web_sys::window() {
-        let closure = wasm_bindgen::closure::Closure::once(move || {
-            leptos::task::spawn_local(async move {
-                try_refresh_or_unauthenticate(&config, state_signal, access_token_signal, id_token_signal).await;
-            });
-        });
-        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-            closure.as_ref().unchecked_ref(),
-            delay_ms,
-        );
-        closure.forget();
+// -- localStorage helpers (best effort; private mode may throw) --
+
+const INFLIGHT_MARKER: &str = "refresh_inflight";
+const LAST_REFRESH_AT: &str = "last_refresh_at";
+
+fn storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok().flatten()
+}
+
+fn read_marker(config: &OidcConfig) -> Option<InflightMarker> {
+    let raw = storage()?.get_item(&config.cookie_name(INFLIGHT_MARKER)).ok()??;
+    InflightMarker::decode(&raw)
+}
+
+fn write_marker(config: &OidcConfig, marker: &InflightMarker) {
+    if let Some(s) = storage() {
+        let _ = s.set_item(&config.cookie_name(INFLIGHT_MARKER), &marker.encode());
     }
 }
 
-/// Try to refresh tokens, or transition to Unauthenticated on failure
-pub async fn try_refresh_or_unauthenticate(
-    config: &OidcConfig,
-    state_signal: leptos::prelude::RwSignal<crate::state::AuthState>,
-    access_token_signal: leptos::prelude::RwSignal<Option<String>>,
-    id_token_signal: leptos::prelude::RwSignal<Option<String>>,
-) {
-    refresh_and_apply(config, state_signal, access_token_signal, id_token_signal, false).await;
+pub(crate) fn clear_marker(config: &OidcConfig) {
+    if let Some(s) = storage() {
+        let _ = s.remove_item(&config.cookie_name(INFLIGHT_MARKER));
+    }
 }
 
-/// Refresh tokens and apply the result to signals + cookies.
-///
-/// Returns the access token now in effect: the freshly refreshed one, or the one
-/// another tab already refreshed to. Returns None when the session is dead
-/// (revoked/no refresh token) or the refresh failed.
-///
-/// `force` skips the expires_at freshness check — use it after the server
-/// rejected a token that still looked valid locally (revoked server-side).
-pub async fn refresh_and_apply(
-    config: &OidcConfig,
-    state_signal: leptos::prelude::RwSignal<crate::state::AuthState>,
-    access_token_signal: leptos::prelude::RwSignal<Option<String>>,
-    id_token_signal: leptos::prelude::RwSignal<Option<String>>,
-    force: bool,
-) -> Option<String> {
-    let result = if force {
-        force_refresh_access_token(config).await
-    } else {
-        refresh_access_token(config).await
-    };
+/// Unix seconds of the last successful refresh / code exchange on this device.
+pub(crate) fn read_last_refresh_at(config: &OidcConfig) -> Option<i64> {
+    storage()?
+        .get_item(&config.cookie_name(LAST_REFRESH_AT))
+        .ok()??
+        .parse()
+        .ok()
+}
 
-    match result {
-        Ok(response) => {
-            let expires_at = (js_sys::Date::new_0().get_time() / 1000.0) as i64
-                + response.expires_in as i64;
-
-            // Update signals
-            access_token_signal.set(Some(response.access_token.clone()));
-            if config.store_id_token {
-                id_token_signal.set(response.id_token.clone());
-            }
-
-            // Extract user info from new tokens
-            let user_info = if let Ok(claims) = crate::token::decode_claims(&response.access_token)
-            {
-                if claims.sub.is_some() {
-                    crate::token::extract_user_info(&claims)
-                } else if let Some(ref id_token) = response.id_token {
-                    crate::token::decode_claims(id_token)
-                        .map(|c| crate::token::extract_user_info(&c))
-                        .unwrap_or_else(|_| crate::state::UserInfo {
-                            subject: String::new(),
-                            email: None,
-                            name: None,
-                            preferred_username: None,
-                        })
-                } else {
-                    // Keep existing user info
-                    match state_signal.get_untracked() {
-                        crate::state::AuthState::Authenticated(info) => info,
-                        _ => crate::state::UserInfo {
-                            subject: String::new(),
-                            email: None,
-                            name: None,
-                            preferred_username: None,
-                        },
-                    }
-                }
-            } else {
-                match state_signal.get_untracked() {
-                    crate::state::AuthState::Authenticated(info) => info,
-                    _ => crate::state::UserInfo {
-                        subject: String::new(),
-                        email: None,
-                        name: None,
-                        preferred_username: None,
-                    },
-                }
-            };
-
-            // Persist UserInfo cookie for SSR fallback (handles opaque access tokens)
-            cookie::browser::write_user_info(config, &user_info);
-
-            state_signal.set(crate::state::AuthState::Authenticated(user_info));
-
-            // Schedule next refresh
-            schedule_refresh(
-                config.clone(),
-                expires_at,
-                state_signal,
-                access_token_signal,
-                id_token_signal,
-            );
-
-            Some(response.access_token)
-        }
-        Err(OidcError::AlreadyRefreshed) => {
-            // Another tab handled it — re-read cookies to update signals
-            if let Some(tokens) = cookie::browser::read_tokens(config) {
-                access_token_signal.set(Some(tokens.access_token.clone()));
-                if config.store_id_token {
-                    id_token_signal.set(tokens.id_token);
-                }
-                // Schedule next refresh based on cookie data
-                schedule_refresh(
-                    config.clone(),
-                    tokens.expires_at,
-                    state_signal,
-                    access_token_signal,
-                    id_token_signal,
-                );
-                Some(tokens.access_token)
-            } else {
-                None
-            }
-        }
-        Err(OidcError::TokenRevoked) | Err(OidcError::NoRefreshToken) => {
-            // Session is dead — clear everything and go to unauthenticated
-            cookie::browser::clear_tokens(config);
-            access_token_signal.set(None);
-            id_token_signal.set(None);
-            state_signal.set(crate::state::AuthState::Unauthenticated);
-            None
-        }
-        Err(e) => {
-            leptos::logging::error!("[oidc] refresh failed: {}", e);
-            state_signal.set(crate::state::AuthState::Error(format!(
-                "Token refresh failed: {}",
-                e
-            )));
-            None
-        }
+pub(crate) fn write_last_refresh_at(config: &OidcConfig, at: i64) {
+    if let Some(s) = storage() {
+        let _ = s.set_item(&config.cookie_name(LAST_REFRESH_AT), &at.to_string());
     }
 }
