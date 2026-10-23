@@ -173,13 +173,23 @@ pub mod browser {
         clear_cookie(&config.cookie_name(USER_INFO), config);
     }
 
-    /// Write PKCE verifier to a short-lived cookie (5 min)
+    /// Lifetime of the transient login cookies (PKCE verifier + OAuth state).
+    /// Must outlast the *interactive* login: the user is redirected to the IdP /
+    /// custom login page, types credentials (possibly after a password reset or
+    /// MFA), and only then returns to the callback where these cookies are read.
+    /// 5 min was too tight — a reset-then-login journey routinely blew past it,
+    /// dropping the state cookie and surfacing "state_missing / expired session"
+    /// at the callback. 30 min comfortably covers human login and stays well
+    /// under Zitadel's auth-request lifetime.
+    const LOGIN_TRANSIENT_MAX_AGE: i64 = 30 * 60; // 30 minutes
+
+    /// Write PKCE verifier to a transient cookie (see LOGIN_TRANSIENT_MAX_AGE)
     pub fn write_pkce_verifier(config: &OidcConfig, verifier: &str) {
         write_cookie(
             &config.cookie_name(PKCE_VERIFIER),
             verifier,
             config,
-            300, // 5 minutes
+            LOGIN_TRANSIENT_MAX_AGE,
         );
     }
 
@@ -193,13 +203,14 @@ pub mod browser {
         clear_cookie(&config.cookie_name(PKCE_VERIFIER), config);
     }
 
-    /// Write OAuth state parameter to a short-lived cookie (5 min) for CSRF verification
+    /// Write OAuth state parameter to a transient cookie for CSRF verification
+    /// (see LOGIN_TRANSIENT_MAX_AGE — same lifetime as the PKCE verifier)
     pub fn write_oauth_state(config: &OidcConfig, state: &str) {
         write_cookie(
             &config.cookie_name(OAUTH_STATE),
             state,
             config,
-            300, // 5 minutes — same as PKCE verifier
+            LOGIN_TRANSIENT_MAX_AGE,
         );
     }
 
